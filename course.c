@@ -51,6 +51,8 @@ enum RacePhase { START_OF_WEEKEND=0, FREE_PRACTICE_1=1, FREE_PRACTICE_2=2, FREE_
 				QUALIFICATION_1=4, QUALIFICATION_2=5, QUALIFICATION_3=6, 
 				SPRINT_QUALIFICATION_1=7, SPRINT_QUALIFICATION_2=8, SPRINT_QUALIFICATION_3=9, 
 				SPRINT=10, RACE=11, FINISH=99};
+// data type readSharedMemoryData can retrieve
+enum SharedMemoryDataType { CAR_STATS, RUNNING_CARS, CAR_TIME_AND_STATUSES, RACE_OVER, CAR_STAT, CAR_TIME_AND_STATUS, PROCESSED_FLAGS };
 
 /* ------------------------------------------
     struct
@@ -100,9 +102,12 @@ typedef struct {
 typedef struct {
 	CarTimeAndStatus carTimeAndStatuses[MAX_PILOT];  // we allocate 20 slots for the car to send data to controller
 	CarStat carStats[MAX_PILOT]; // 20 slots for all pilot data
-	int carRunning; // amount of still running car (when 0 = no car running anymore, all race/qualif ended)
-	sem_t semaphore; // semaphore for synchronisation
+	int runningCars; // amount of still running car (when 0 = no car running anymore, all race/qualif ended)
 	bool raceOver; // indicate if a pilot reach finish line (all other car must finish their lap and stop)
+
+	sem_t mutex; // semaphore for writers (exclusive access: only 1 writer as access)
+	sem_t mutread; // semaphore for readers (shared access: as many readers as needed)
+	int readerCount; // count how many reader we have
 } SharedMemory;
 
 // Driver's data (data from drivers.csv)
@@ -112,7 +117,7 @@ typedef struct {
 	char shortName[4]; // 3 letters name
 } DriverData;
 
-// Track's data (data from  tracks.csv)
+// Track's data (data from tracks.csv)
 typedef struct {
 	char country[50];
 	char name[50];
@@ -123,13 +128,11 @@ typedef struct {
 // ------------------------------------------
 //  Global variables
 // ------------------------------------------
-int driverCount = 0;
 DriverData drivers[MAX_PILOT];
-int trackCount = 0;
 TrackData tracks[MAX_TRACK];
 
 // Pointer to shared memory
-SharedMemory *shared_mem = NULL;
+SharedMemory *sharedMemory = NULL;
 
 // ------------------------------------------
 //  Functions
@@ -148,9 +151,8 @@ void carTime2HMS(char* carTimeAsString, CarTime carTime);
 /**
  * General purpose functions
 */
-void millisWait(int millis);
+int millisWait(int millis);
 char getConfirmation();
-void cleanupSharedMemory(int signum);
 const char* racePhaseToShortString(enum RacePhase phase);
 char* getDriverName(int id);
 int getTrackLap(int trackNumber,enum RacePhase phase);
@@ -162,8 +164,8 @@ int comparePilotStat(const void * elem1, const void * elem2);
 /**
  * File access functions
 */
-void readDriverData(DriverData* drivers, int *driverCount);
-void readTrackData(TrackData* tracks, int *trackCount);
+void readDriverData(DriverData* drivers);
+void readTrackData(TrackData* tracks);
 void savePhaseResult(int race, enum RacePhase phase, int pilotRunning);
 void loadPhaseResult(CarStat* carStats, int race, enum RacePhase phase);
 void saveChampionshipResult(int race, enum RacePhase phase);
@@ -189,6 +191,18 @@ void controller(int trackNumber,int phase, int pilotRunning);
 void carSimulator(int id, CarTime delay, int trackNumber,enum RacePhase phase);
 void carSimulatorRace(int id, CarTime delay, int maxLap);
 void carSimulatorQualification(int id, int maxTime);
+
+/**
+ * Shared Memory Functions (implementing "Courtois" algorithm)
+*/
+void cleanupSharedMemory(int signum);
+void readSharedMemoryData(void* data, enum SharedMemoryDataType smdt);
+int getRunningCars();
+void decrementRunningCars();
+void setRaceAsOver();
+bool isRaceOver();
+void setCarTimeAndStatusAsProcessed(int i);
+void updateCarStat(CarStat carStat, int i);
 int sendDataToController(int id, CarTimeAndStatus status);
 
 /**
@@ -236,7 +250,7 @@ int compareCarStatRace(const void * elem1, const void * elem2) {
 		return 1;
 	}
 	
-	// if same distance, better time comes first
+	// same distance, better time comes first
 	return compareCarTime(cr1.totalTime, cr2.totalTime);
 }
 
@@ -334,12 +348,14 @@ void carTime2HMS(char* carTimeAsString, CarTime carTime) {
 }
 
 // -----------------------------------------------------------
-// function to wait a few milliseconds
-void millisWait(int millis) {
+// function to wait a few milliseconds, return millis
+int millisWait(int millis) {
 	struct timespec ts;
 	ts.tv_sec = millis / 1000;
 	ts.tv_nsec = (millis % 1000) * 1000 * 1000;
 	nanosleep(&ts, NULL);
+
+	return millis;
 }
 
 char getConfirmation() {
@@ -359,19 +375,6 @@ char getConfirmation() {
 
         printf("Invalid input. Enter Y or N.\n");
     }
-}
-
-// Shared memory Clean-up function
-void cleanupSharedMemory(int signum) {
-	if (shared_mem) {
-		// destroy semaphore
-		sem_destroy(&shared_mem->semaphore);
-		// detach from shared memory
-		shmdt(shared_mem);
-		// clean shared memory (IPC_RMID), will be effectivelly done when all processes are detached
-		shmctl(shmget(SHM_KEY, sizeof(SharedMemory), 0666), IPC_RMID, NULL);
-	}
-	exit(0);
 }
 
 // used in filename
@@ -394,7 +397,7 @@ const char* racePhaseToShortString(enum RacePhase phase) {
 }
 
 char* getDriverName(int id) {
-	for(int i=0;i<driverCount;i++) {
+	for(int i=0;i<MAX_PILOT;i++) {
 		if (drivers[i].id == id) {
 			return drivers[i].name;
 		}
@@ -486,20 +489,20 @@ int comparePilotStat(const void * elem1, const void * elem2) {
 
 // --------------------------------------------------------------------
 // read drivers.csv and store data into global variable drivers
-void readDriverData(DriverData *drivers, int * driverCount) {
+void readDriverData(DriverData *drivers) {
 	FILE *file = fopen("drivers.csv", "r");
 
-    *driverCount = 0;
+    int driverCount = 0;
     if (file == NULL) {
 		perror("Unable to read drivers");
 		exit(1);
 	} else {
 		char line[100]; // Buffer
-		while (fgets(line, sizeof(line), file)) {
+		while (fgets(line, sizeof(line), file) && driverCount < MAX_PILOT) {
 			// Read ID and Name (max 49 character long) 
-			sscanf(line, "%d;%3[^;];%49[^\n]", &drivers[*driverCount].id, drivers[*driverCount].shortName, drivers[*driverCount].name);
+			sscanf(line, "%d;%3[^;];%49[^\n]", &drivers[driverCount].id, drivers[driverCount].shortName, drivers[driverCount].name);
 			// increment counter
-			(*driverCount)++;
+			driverCount++;
 		}
 
 		fclose(file);
@@ -507,28 +510,28 @@ void readDriverData(DriverData *drivers, int * driverCount) {
 }
 
 // read tracks.csv and store data into global variable tracks
-void readTrackData(TrackData* tracks, int * trackCount) {
+void readTrackData(TrackData* tracks) {
     FILE *file = fopen("tracks.csv", "r");
 
-    *trackCount = 0;
+    int trackCount = 0;
     if (file == NULL) {
 		perror("Unable to read tracks.csv");
 		exit(1);
 	} else {
 		char line[200]; // Buffer
-		while (fgets(line, sizeof(line), file)) {
+		while (fgets(line, sizeof(line), file) && trackCount < MAX_TRACK) {
 			char weekendType[20];
 			// country, name and length 
-			sscanf(line, "%49[^;];%49[^;];%49[^;];%d", tracks[*trackCount].country, tracks[*trackCount].name, weekendType, &tracks[*trackCount].length);
+			sscanf(line, "%49[^;];%49[^;];%49[^;];%d", tracks[trackCount].country, tracks[trackCount].name, weekendType, &tracks[trackCount].length);
 
 			// convert special/normal to boolean
 			if (strcmp(weekendType,"sprint") == 0) {
-				tracks[*trackCount].sprint = true;
+				tracks[trackCount].sprint = true;
 			} else {
-				tracks[*trackCount].sprint = false;
+				tracks[trackCount].sprint = false;
 			}
 			// increment counter
-			(*trackCount)++;
+			trackCount++;
 		}
 
 		fclose(file);
@@ -547,7 +550,7 @@ void savePhaseResult(int race, enum RacePhase phase, int pilotRunning) {
 	} else {
 		// Sort data
 		CarStat carStats[MAX_PILOT] = {0};
-		memcpy(carStats, &shared_mem->carStats, sizeof(CarStat)*MAX_PILOT);
+		memcpy(carStats, &sharedMemory->carStats, sizeof(CarStat)*MAX_PILOT);
 		if (phase == SPRINT || phase == RACE) {
 			qsort(carStats,pilotRunning,sizeof(CarStat),compareCarStatRace);
 		} else {
@@ -612,7 +615,7 @@ void saveChampionshipResult(int race, enum RacePhase phase) {
 	} else {
 		// Sort race data
 		CarStat carStats[MAX_PILOT];
-		memcpy(carStats, shared_mem->carStats, sizeof(CarStat)*MAX_PILOT);
+		memcpy(carStats, sharedMemory->carStats, sizeof(CarStat)*MAX_PILOT);
 		qsort(carStats,MAX_PILOT,sizeof(CarStat),compareCarStatRace);
 		
 		// Save data
@@ -889,30 +892,29 @@ void displayData(const CarStat* carStats, const CarStat* carStatsPrevious, bool 
 
 void screenManager(enum RacePhase phase, int pilotRunning) {
 	CarStat carStatsPrevious[MAX_PILOT];
+	CarStat carStats[MAX_PILOT];
+
 	// Get at least once the data (for comparison)
-	sem_wait(&shared_mem->semaphore);
-	memcpy(carStatsPrevious, &shared_mem->carStats, sizeof(CarStat)*MAX_PILOT);
-	sem_post(&shared_mem->semaphore);
+	readSharedMemoryData(carStatsPrevious, CAR_STATS);
 
 	// race or qualification ?
 	bool race = (phase == RACE) || (phase == SPRINT);
 
-	while (shared_mem->carRunning > 0) {
+	while (getRunningCars() > 0) {
+		// read data
+		readSharedMemoryData(carStats, CAR_STATS);
 		// update display
-		sem_wait(&shared_mem->semaphore);
-		displayData(shared_mem->carStats, carStatsPrevious, race, pilotRunning);
-		memcpy(carStatsPrevious, &shared_mem->carStats, sizeof(CarStat)*MAX_PILOT);
-		sem_post(&shared_mem->semaphore);
+		displayData(carStats, carStatsPrevious, race, pilotRunning);
+		// copy carStats to carStatsPrevious
+		memcpy(carStatsPrevious, carStats, sizeof(CarStat)*MAX_PILOT);
 		// wait 1 seconds
 		millisWait(1000);
 	}
 
-	// last update
-	// wait 1 seconds
-	millisWait(1000);
-	sem_wait(&shared_mem->semaphore);
-	displayData(shared_mem->carStats, carStatsPrevious, race, pilotRunning);
-	sem_post(&shared_mem->semaphore);
+	// No more car running, do a last update and display
+	// read data and display them
+	readSharedMemoryData(carStats, CAR_STATS);
+	displayData(carStats, carStatsPrevious, race, pilotRunning);
 }	
 
 void displayLogo() {
@@ -961,7 +963,7 @@ void displayLogo() {
 }
 
 char* getDriverShortName(int id) {
-	for(int i=0;i<driverCount;i++) {
+	for(int i=0;i<MAX_PILOT;i++) {
 		if (drivers[i].id == id) {
 			return drivers[i].shortName;
 		}
@@ -974,17 +976,22 @@ char* getDriverShortName(int id) {
 void controller(int trackNumber, int phase, int pilotRunning) {	
 	// determine number of lap
 	int maxLap=getTrackLap(trackNumber, phase);
+	CarTimeAndStatus carTimeAndStatuses[MAX_PILOT];
+	CarStat carStats[MAX_PILOT];
 	
 	bool controllerStop = false;
-	// infinite loop (will be stopped when all car are stopped)
+	// infinite loop (will be stopped when all cars are stopped)
 	while (!controllerStop) {
 		// check if still car simulator running
-		controllerStop = (shared_mem->carRunning == 0);
+		controllerStop = (getRunningCars() == 0);
+
+		// read CarTimeAndStatuses
+		readSharedMemoryData(carTimeAndStatuses,CAR_TIME_AND_STATUSES);
 
 		// Check if any data from car simulator to proceed
 		bool processPending=false;
 		for (int i = 0; i < pilotRunning; i++) {
-			if (!shared_mem->carTimeAndStatuses[i].processed) {
+			if (!carTimeAndStatuses[i].processed) {
 				processPending=true;
 				break;
 			}
@@ -999,81 +1006,81 @@ void controller(int trackNumber, int phase, int pilotRunning) {
 			continue;
 		}
 
-		// Some pending CarTimeAndStatus(s), get exclusive access using semaphore 
-		sem_wait(&shared_mem->semaphore);
-		
+		// read CarStat (we have update to do)
+		readSharedMemoryData(carStats,CAR_STATS);
+
 		// Check all records
 		for (int i = 0; i < pilotRunning; i++) {
 			// processed == 0 => data still to be processed
-			if (shared_mem->carTimeAndStatuses[i].processed == false) {
-				if (shared_mem->carTimeAndStatuses[i].carStatus == CRASHED) {
+			if (carTimeAndStatuses[i].processed == false) {
+				if (carTimeAndStatuses[i].carStatus == CRASHED) {
 					// car crashed => no time to proceed
-					shared_mem->carStats[i].crashed=true;
-				} else if (shared_mem->carTimeAndStatuses[i].carStatus == WAIT_IN_STAND) {
+					carStats[i].crashed=true;
+				} else if (carTimeAndStatuses[i].carStatus == WAIT_IN_STAND) {
 					// car in stand => no time to proceed
-					shared_mem->carStats[i].inStand=true;
+					carStats[i].inStand=true;
 				} else {
 					// car running (so no more in stand)
-					shared_mem->carStats[i].inStand=false;
+					carStats[i].inStand=false;
 
 					// did a pit stop ?
-					if (shared_mem->carTimeAndStatuses[i].carStatus == PITSTOP) {
-						shared_mem->carStats[i].pitStopCount++;
+					if (carTimeAndStatuses[i].carStatus == PITSTOP) {
+						carStats[i].pitStopCount++;
 					}
 					
 					// determine the section
 					// 0 -> 1st section, 1 = 2nd section, 2 = 3rd section
-					int sectionNumber = (shared_mem->carStats[i].distance % 3);
+					int sectionNumber = (carStats[i].distance % 3);
 					
 					// increment distance (counting number of section done, number of lap distance/3)
-					shared_mem->carStats[i].distance++;
+					carStats[i].distance++;
 
 					// save section timing
-					shared_mem->carStats[i].currentSectionTime[sectionNumber].seconds=shared_mem->carTimeAndStatuses[i].sectionTime.seconds;
-					shared_mem->carStats[i].currentSectionTime[sectionNumber].milliseconds=shared_mem->carTimeAndStatuses[i].sectionTime.milliseconds;
+					carStats[i].currentSectionTime[sectionNumber].seconds=carTimeAndStatuses[i].sectionTime.seconds;
+					carStats[i].currentSectionTime[sectionNumber].milliseconds=carTimeAndStatuses[i].sectionTime.milliseconds;
 					
 					// Compare with best section
-					if (compareCarTime(shared_mem->carStats[i].currentSectionTime[sectionNumber], shared_mem->carStats[i].bestSectionTime[sectionNumber]) < 0) {
+					if (compareCarTime(carStats[i].currentSectionTime[sectionNumber], carStats[i].bestSectionTime[sectionNumber]) < 0) {
 						// new best section time
-						shared_mem->carStats[i].bestSectionTime[sectionNumber].seconds = shared_mem->carStats[i].currentSectionTime[sectionNumber].seconds;
-						shared_mem->carStats[i].bestSectionTime[sectionNumber].milliseconds = shared_mem->carStats[i].currentSectionTime[sectionNumber].milliseconds;
+						carStats[i].bestSectionTime[sectionNumber].seconds = carStats[i].currentSectionTime[sectionNumber].seconds;
+						carStats[i].bestSectionTime[sectionNumber].milliseconds = carStats[i].currentSectionTime[sectionNumber].milliseconds;
 					}
 					
 					// if 3rd section, compute lap time
 					if (sectionNumber==2) {
 						// lapTime = S1 + S2 + S3
 						CarTime lapTime;
-						lapTime.seconds = shared_mem->carStats[i].currentSectionTime[0].seconds;
-						lapTime.milliseconds = shared_mem->carStats[i].currentSectionTime[0].milliseconds;
-						combineCarTime(&lapTime,shared_mem->carStats[i].currentSectionTime[1]);
-						combineCarTime(&lapTime,shared_mem->carStats[i].currentSectionTime[2]);
+						lapTime.seconds = carStats[i].currentSectionTime[0].seconds;
+						lapTime.milliseconds = carStats[i].currentSectionTime[0].milliseconds;
+						combineCarTime(&lapTime,carStats[i].currentSectionTime[1]);
+						combineCarTime(&lapTime,carStats[i].currentSectionTime[2]);
 						
 						// check if new best lapTime
-						if (compareCarTime(lapTime, shared_mem->carStats[i].bestLap) < 0) {
-							shared_mem->carStats[i].bestLap.seconds = lapTime.seconds;
-							shared_mem->carStats[i].bestLap.milliseconds = lapTime.milliseconds;
+						if (compareCarTime(lapTime, carStats[i].bestLap) < 0) {
+							carStats[i].bestLap.seconds = lapTime.seconds;
+							carStats[i].bestLap.milliseconds = lapTime.milliseconds;
 						}
 					
 						// Update total time
-						combineCarTime(&(shared_mem->carStats[i].totalTime), lapTime);
+						combineCarTime(&(carStats[i].totalTime), lapTime);
 					}
 
 					// check if race is over
 					if (phase == SPRINT || phase == RACE) {
-						if (shared_mem->carStats[i].distance/3 == maxLap) {
+						if (carStats[i].distance/3 == maxLap) {
 							// race is over, all other simulator must stop
-							shared_mem->raceOver=true;
+							setRaceAsOver();
 						}
 					}
 				}
 				
 				// Mark CarTimeAndStatus as processed
-				shared_mem->carTimeAndStatuses[i].processed = true;
+				setCarTimeAndStatusAsProcessed(i);
+				
+				// update CarStat (for screen Manager)
+				updateCarStat(carStats[i],i);				
 			}
 		}
-		
-		// free semaphore
-		sem_post(&shared_mem->semaphore);
 	}
 }
 
@@ -1115,8 +1122,7 @@ void carSimulator(int id, CarTime delay, int trackNumber, enum RacePhase phase) 
 	}
 
 	// the car finished practice, qualification, sprint or race
-	// __sync_fetch_and_sub is doing an atomic substraction (we are sure that 1 and only 1 process will do this decrement at the same time)
-	__sync_fetch_and_sub(&shared_mem->carRunning,1);
+	decrementRunningCars();
 }
 
 // -----------------------------------------
@@ -1142,7 +1148,7 @@ void carSimulatorRace(int id, CarTime delay, int maxLap) {
 		// 2 stops
 		pitStopLap[0]=maxLap/3+(rand()%11)-5;
 		pitStopLap[1]=(maxLap/3)*2+(rand()%11)-5;
-		pitStopLap[9]=9999;
+		pitStopLap[2]=9999; // no 3rd pit stop
 	} else {
 		// 3 stops
 		pitStopLap[0]=maxLap/4+(rand()%11)-5;
@@ -1150,7 +1156,7 @@ void carSimulatorRace(int id, CarTime delay, int maxLap) {
 		pitStopLap[2]=(maxLap/4)*3+(rand()%11)-5;
 	}
 
-	// loop for the number of lap x number of section (3)
+	// loop for the number of lap * 3 (number of section)
 	bool running = true;
 	bool crashed = false;
 	bool pitStop = false;
@@ -1168,7 +1174,7 @@ void carSimulatorRace(int id, CarTime delay, int maxLap) {
 		
 		// check if end of race (someone already reached finish line)
 		if (i % 3 == 2) {
-			if (shared_mem->raceOver) {
+			if (isRaceOver()) {
 				running = false;
 			}
 		}
@@ -1255,7 +1261,7 @@ void carSimulatorQualification(int id, int maxTime) {
 		// 2b. do the lap
 		for (int section=0;section<3;section++) {
 			CarTime updateTime;
-			updateTime.seconds=(rand() % 7) - 3; // between -3 and 3
+			updateTime.seconds=(rand() % 5) - 2; // between -2 and 2
 			updateTime.milliseconds=(rand() % 1999) - 999; // between -999 and 999
 			combineCarTime(&(carTimeStatus.sectionTime), updateTime);
 
@@ -1282,46 +1288,171 @@ void carSimulatorQualification(int id, int maxTime) {
 	}
 }
 
-// send data to controller, return "lost time" for update (wait time for controller to process previous data+lock semaphore)
+// -------------------------------------------------------------
+// Shared memory Clean-up function
+void cleanupSharedMemory(int signum) {
+	if (sharedMemory) {
+		// destroy semaphores
+		sem_destroy(&sharedMemory->mutex);
+		sem_destroy(&sharedMemory->mutread);
+		// detach from shared memory
+		shmdt(sharedMemory);
+		// clean shared memory (IPC_RMID), will be effectivelly done when all processes are detached
+		shmctl(shmget(SHM_KEY, sizeof(SharedMemory), 0666), IPC_RMID, NULL);
+	}
+	exit(0);
+}
+
+// send data to controller, return "lost time" for update (time waited for locking semaphore and controller)
 int sendDataToController(int id, CarTimeAndStatus status) {
 	// in case we are not able to immediatly update data, we will wait a few milliseconds, keep track of those waits
 	long alreadyWait = 0;		
 	// loop until data are copied to shared memory
 	while (1) {
-		// check if data already treated by controller
-		if (shared_mem->carTimeAndStatuses[id].processed == false) {
-			// not treated, will wait a while and retry
-			long randomWait = rand() % 20 + 1;
-			millisWait(randomWait);
-			// keep track of the wait
-			alreadyWait += randomWait;
-			// retry 
-			continue;			
-		}
-		
-		// data processed -> try to get exclusive access
-		if (sem_trywait(&shared_mem->semaphore)) {
+		// try to get writer exclusive access
+		if (sem_trywait(&sharedMemory->mutex)) {
 			// unable to acquire lock -> will try again after a few milliseconds
-			long randomWait = rand() % 20 + 1;
-			millisWait(randomWait);
-			// keep track of the wait
-			alreadyWait += randomWait;
+			alreadyWait += millisWait(rand() % 20 + 1);
 			// retry 
-			continue;			
+			continue;
 		}
 
-		// data processed by controller and lock acquired -> copy new section time and pitStop
-		memcpy(&shared_mem->carTimeAndStatuses[id], &status, sizeof(CarTimeAndStatus));
-		shared_mem->carTimeAndStatuses[id].processed = false;
+		// check if data already treated by controller
+		if (sharedMemory->carTimeAndStatuses[id].processed == false) {
+			// not treated, release exclusive access and wait a few milliseconds before retry
+			sem_post(&sharedMemory->mutex);
+			alreadyWait += millisWait(rand() % 20 + 1);
+			// retry 
+			continue;			
+		}
+		
+		// exclusive writer access granted and data processed by controller -> copy new section time and pitStop
+		memcpy(&sharedMemory->carTimeAndStatuses[id], &status, sizeof(CarTimeAndStatus));
+		sharedMemory->carTimeAndStatuses[id].processed = false;
 		
 		// release exclusive access
-		sem_post(&shared_mem->semaphore);
+		sem_post(&sharedMemory->mutex);
 
 		// quit update loop
 		break;
 	}
 
 	return alreadyWait;
+}
+
+// read processed flag
+bool isCarTimeAndStatusProcessed(int id) {
+	bool abProcessed[MAX_PILOT];
+
+	readSharedMemoryData(abProcessed, PROCESSED_FLAGS);
+	
+	return abProcessed[id];
+}
+
+// read sharedMemoryData
+void readSharedMemoryData(void* data, enum SharedMemoryDataType smdt) {
+	// get exclusive access to reader variable
+	sem_wait(&sharedMemory->mutread);
+	// increment reader count
+	sharedMemory->readerCount++;
+	if (sharedMemory->readerCount == 1) {
+		// we are the first reader, we have to block the writers
+		sem_wait(&sharedMemory->mutex);
+	}
+	// free reader access
+	sem_post(&sharedMemory->mutread);
+
+	switch(smdt) {
+		case CAR_STATS: 
+			memcpy(data, &sharedMemory->carStats, sizeof(CarStat)*MAX_PILOT);
+			break;
+		case RUNNING_CARS:
+			*((int*)data) = sharedMemory->runningCars;
+			break;
+		case CAR_TIME_AND_STATUSES:
+			memcpy(data, &sharedMemory->carTimeAndStatuses, sizeof(CarTimeAndStatus)*MAX_PILOT);
+			break;
+		case RACE_OVER:
+			*((bool*)data) = sharedMemory->raceOver;
+			break;
+		case PROCESSED_FLAGS:
+			for (int i=0;i<MAX_PILOT;i++) {
+				((bool*)data)[i] = sharedMemory->carTimeAndStatuses[i].processed;
+			}
+			break;
+	}
+
+	// get exclusive access to reader variable
+	sem_wait(&sharedMemory->mutread);
+	// decrement reader count
+	sharedMemory->readerCount--;
+	if (sharedMemory->readerCount == 0) {
+		// No more reader, free the writers
+		sem_post(&sharedMemory->mutex);
+	}
+	// free reader access
+	sem_post(&sharedMemory->mutread);
+}
+
+int getRunningCars() {
+	int runningCars;
+
+	readSharedMemoryData(&runningCars, RUNNING_CARS);
+
+	return runningCars;
+}
+
+void decrementRunningCars() {
+	// get exclusive access to shared memory
+	sem_wait(&sharedMemory->mutex);
+
+	// decrement running cars
+	sharedMemory->runningCars--;
+	
+	// relase exclusive access
+	sem_post(&sharedMemory->mutex);
+}
+
+// set race as over
+void setRaceAsOver() {
+	// get exclusive access to shared memory
+	sem_wait(&sharedMemory->mutex);
+
+	// set race as Over
+	sharedMemory->raceOver=true;
+
+	// relase exclusive access
+	sem_post(&sharedMemory->mutex);
+}
+
+bool isRaceOver() {
+	bool isRaceOver;
+
+	readSharedMemoryData(&isRaceOver, RACE_OVER);
+
+	return isRaceOver;
+}
+
+void setCarTimeAndStatusAsProcessed(int i) {
+	// get exclusive access to shared memory
+	sem_wait(&sharedMemory->mutex);
+
+	// set processed to true
+	sharedMemory->carTimeAndStatuses[i].processed = true;
+
+	// relase exclusive access
+	sem_post(&sharedMemory->mutex);
+}
+
+void updateCarStat(CarStat carStat, int i) {
+	// get exclusive access to shared memory
+	sem_wait(&sharedMemory->mutex);
+
+	// set processed to true
+	memcpy(&(sharedMemory->carStats[i]),&carStat,sizeof(CarStat));
+
+	// relase exclusive access
+	sem_post(&sharedMemory->mutex);
 }
 
 // -------------------------------------------------------------
@@ -1420,8 +1551,7 @@ void displayRanking(int raceNumber) {
 	int pos=1;
 	for (int i=0;i<MAX_PILOT;i++) {
 		if (i>0 && pilotStats[i].score == pilotStats[i-1].score && pilotStats[i].raceWon == pilotStats[i-1].raceWon) {
-			// equality
-			pos--;
+			// equality, driver is at same position in ranking
 		} else {
 			pos=i+1;
 		}
@@ -1439,10 +1569,10 @@ void displayRanking(int raceNumber) {
 */
 int main(int argc, char *argv[]) {
 	// Read track data
-	readTrackData(tracks,&trackCount);
+	readTrackData(tracks);
 
 	// Read driver data
-	readDriverData(drivers,&driverCount);
+	readDriverData(drivers);
 	
 	// variable to store where we are in the championship
 	int raceNumber;
@@ -1540,8 +1670,8 @@ int main(int argc, char *argv[]) {
 		exit(EXIT_FAILURE);
 	}
 
-	shared_mem = (SharedMemory *)shmat(shmid, NULL, 0);
-	if (shared_mem == (void *)-1) {
+	sharedMemory = (SharedMemory *)shmat(shmid, NULL, 0);
+	if (sharedMemory == (void *)-1) {
 		perror("Error when attaching to shared memory");
 		exit(EXIT_FAILURE);
 	}
@@ -1550,50 +1680,50 @@ int main(int argc, char *argv[]) {
 	signal(SIGINT, cleanupSharedMemory);
 
 	// Initialize shared memory
-	memset(shared_mem->carTimeAndStatuses, 0, sizeof(shared_mem->carTimeAndStatuses));
-	memset(shared_mem->carStats, 0, sizeof(shared_mem->carStats));
+	memset(sharedMemory->carTimeAndStatuses, 0, sizeof(sharedMemory->carTimeAndStatuses));
+	memset(sharedMemory->carStats, 0, sizeof(sharedMemory->carStats));
 		
 	// if in free practice or qualification 1 => all pilots are running, we don't care in which order)
 	if (phase == FREE_PRACTICE_1 || phase == FREE_PRACTICE_2 || phase == FREE_PRACTICE_3 
 		|| phase == QUALIFICATION_1 || phase == SPRINT_QUALIFICATION_1) {
 		for (int i=0;i<MAX_PILOT;i++) {
-			shared_mem->carStats[i].pilotNumber = drivers[i].id;
-			shared_mem->carStats[i].inStand = true;
+			sharedMemory->carStats[i].pilotNumber = drivers[i].id;
+			sharedMemory->carStats[i].inStand = true;
 		}
 	} else {
 		// we are in qualification 2/3 or sprint or race, order is important and based on previous result 
 		enum RacePhase previousPhase = getPreviousPhase(phase, tracks[raceNumber].sprint);
-		loadPhaseResult(shared_mem->carStats, raceNumber, previousPhase);
+		loadPhaseResult(sharedMemory->carStats, raceNumber, previousPhase);
 	}
 
 	// best lap and sections time are set to 999.999
 	for (int i=0;i<MAX_PILOT;i++) {
-		shared_mem->carTimeAndStatuses[i].carStatus = WAIT_IN_STAND;
-		shared_mem->carStats[i].bestLap.seconds = 999;
-		shared_mem->carStats[i].bestLap.milliseconds = 999;
+		sharedMemory->carTimeAndStatuses[i].carStatus = WAIT_IN_STAND;
+		sharedMemory->carStats[i].bestLap.seconds = 999;
+		sharedMemory->carStats[i].bestLap.milliseconds = 999;
 		for (int j=0;j<3;j++) {
-			shared_mem->carStats[i].bestSectionTime[j].seconds = 999;
-			shared_mem->carStats[i].bestSectionTime[j].milliseconds = 999;
+			sharedMemory->carStats[i].bestSectionTime[j].seconds = 999;
+			sharedMemory->carStats[i].bestSectionTime[j].milliseconds = 999;
 		}
 	}
 
 	// Mark all carTimeStatus as processed (so car simulator can add new data)
 	for (int i = 0; i < MAX_PILOT; i++) {
-		shared_mem->carTimeAndStatuses[i].processed = true;
+		sharedMemory->carTimeAndStatuses[i].processed = true;
 	}
 	
 	// create semaphore
-	//   &shared_mem->semaphore: will be used between different processus, so located in the shared memory
+	//   &sharedMemory->mutex/mutread: will be used between different processus, so located in the shared memory
 	//   1: indicates that the semaphore will be used between processus and not between threads
-	//   0: initial value
-	sem_init(&shared_mem->semaphore, 1, 0);
-	shared_mem->carRunning = pilotRunning;
+	//   1: initial value
+	sem_init(&sharedMemory->mutex, 1, 1);
+	sem_init(&sharedMemory->mutread, 1, 1);
+	sharedMemory->runningCars = pilotRunning;
 
+	// After this point, we will launch multiple process, so access to shared memory will be done using specific function using semaphores
 	// Launch controller
 	pid_t controller_pid = fork();
 	if (controller_pid == 0) {
-		// increment semaphore, so that processes can do a sem_wait to get control of it
-		sem_post(&shared_mem->semaphore);
 		// execute the controller
 		controller(raceNumber, phase, pilotRunning);
 		exit(0);
@@ -1602,10 +1732,12 @@ int main(int argc, char *argv[]) {
 	// Launch the carSimulator
 	for (int i = 0; i < pilotRunning; i++) {
 		pid_t pid = fork();
-		CarTime delay;
-		delay.seconds=i/2;
-		delay.milliseconds=(i*500)%1000;
 		if (pid == 0) {
+			// delay is used to simulate position on the track when starting a race.  Ignored if free practise or qualification
+			CarTime delay;
+			delay.seconds=i/2;
+			delay.milliseconds=(i*500)%1000;
+			// execute the car simulator
 			carSimulator(i,delay,raceNumber,phase);
 			exit(0);
 		}
@@ -1620,8 +1752,11 @@ int main(int argc, char *argv[]) {
 	}
 
 	// Wait until all childs are stopped (controller/car simulators/screen manager)
+	// wait return the pid of the child
 	while (wait(NULL) > 0);
 
+	// After this point, only the main function is running, all child are stopped,
+	// so no need to maange concurrent access to shared memory
 	// save phase result
 	savePhaseResult(raceNumber, phase, pilotRunning);
 

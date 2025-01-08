@@ -30,6 +30,12 @@ Arabie Saoudite;Jeddah Corniche Circuit;normal;6174
 Australie;Albert Park Circuit;normal;5278
 Azerbaijan;Baku City Circuit;sprint;6003
 ```
+### les fichiers créés par le programme
+Le programme va créé plusieurs fichiers lors des différentes exécutions, on peut les classer en 3 types:
+* championship.txt: c'est le fichier qui indique la dernière course/phase exécuté.  Il contient 2 lignes: `race=n` et `phase=m`.  Au démarrage, le programme lit le fichier pour savoir quelle sera la phase suivante à simuler.  Si le fichier n'existe pas, on suppose que l'on est au début du championnat
+* race_nn_pp.csv: c'est le résultat de la simulation.  On retouve la liste des pilotes classés en fonction de leur résultat.  Il sera utilisé lors de certaines pour déterminer le classement des pilotes sur la piste de départ (qualification 2/3, sprint et course finale).  Il contient le numéro du pilote, ses temps pour le meilleur tour et meilleur temps de chaque section.
+* race_nn_(race|sprint)_ranking.csv: c'est le résultat du sprint ou de la course.  On retrouve 2 informations: le numéro du pilote et le nombre de point marqué.  Ces fichiers sont lu par le programme à la fin de la simulation pour afficher le classement des pilotes.
+ 
 ## Description du programme
 Ce programme simule un week-end de course de formule 1: à savoir les essais libres et qualifications ou la course (ou sprint).
 Pour ce faire, le programme principal va démarrer 3 types de sous-process (controller, carSimulator, screenManager) et attendre qu'ils se terminent.

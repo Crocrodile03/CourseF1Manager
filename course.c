@@ -913,6 +913,7 @@ void screenManager(enum RacePhase phase, int pilotRunning) {
 
 	// No more car running, do a last update and display
 	// read data and display them
+	millisWait(1000);
 	readSharedMemoryData(carStats, CAR_STATS);
 	displayData(carStats, carStatsPrevious, race, pilotRunning);
 }	

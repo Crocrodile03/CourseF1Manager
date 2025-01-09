@@ -52,7 +52,7 @@ enum RacePhase { START_OF_WEEKEND=0, FREE_PRACTICE_1=1, FREE_PRACTICE_2=2, FREE_
 				SPRINT_QUALIFICATION_1=7, SPRINT_QUALIFICATION_2=8, SPRINT_QUALIFICATION_3=9, 
 				SPRINT=10, RACE=11, FINISH=99};
 // data type readSharedMemoryData can retrieve
-enum SharedMemoryDataType { CAR_STATS, RUNNING_CARS, CAR_TIME_AND_STATUSES, RACE_OVER, CAR_STAT, CAR_TIME_AND_STATUS, PROCESSED_FLAGS };
+enum SharedMemoryDataType { CAR_STATS, RUNNING_CARS, CAR_TIME_AND_STATUSES, RACE_OVER, PROCESSED_FLAGS };
 
 /* ------------------------------------------
     struct
@@ -198,9 +198,9 @@ void carSimulatorQualification(int id, int maxTime);
 void cleanupSharedMemory(int signum);
 void readSharedMemoryData(void* data, enum SharedMemoryDataType smdt);
 int getRunningCars();
+bool isRaceOver();
 void decrementRunningCars();
 void setRaceAsOver();
-bool isRaceOver();
 void setCarTimeAndStatusAsProcessed(int i);
 void updateCarStat(CarStat carStat, int i);
 int sendDataToController(int id, CarTimeAndStatus status);
@@ -1305,23 +1305,23 @@ void cleanupSharedMemory(int signum) {
 
 // send data to controller, return "lost time" for update (time waited for locking semaphore and controller)
 int sendDataToController(int id, CarTimeAndStatus status) {
-	// in case we are not able to immediatly update data, we will wait a few milliseconds, keep track of those waits
-	long alreadyWait = 0;		
+    // variables to keep track of the time "lost" for sending the data
+	struct timespec start, end;
+    long alreadyWait;
+
+    // Get start time
+    clock_gettime(CLOCK_MONOTONIC, &start);
+		
 	// loop until data are copied to shared memory
 	while (1) {
-		// try to get writer exclusive access
-		if (sem_trywait(&sharedMemory->mutex)) {
-			// unable to acquire lock -> will try again after a few milliseconds
-			alreadyWait += millisWait(rand() % 20 + 1);
-			// retry 
-			continue;
-		}
+		// Get writer exclusive access
+		sem_wait(&sharedMemory->mutex);
 
 		// check if data already treated by controller
 		if (sharedMemory->carTimeAndStatuses[id].processed == false) {
 			// not treated, release exclusive access and wait a few milliseconds before retry
 			sem_post(&sharedMemory->mutex);
-			alreadyWait += millisWait(rand() % 20 + 1);
+			millisWait(rand() % 20 + 1);
 			// retry 
 			continue;			
 		}
@@ -1336,6 +1336,13 @@ int sendDataToController(int id, CarTimeAndStatus status) {
 		// quit update loop
 		break;
 	}
+
+    // Get end time
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
+    // Compute diff in milliseconds
+    alreadyWait = (end.tv_sec - start.tv_sec) * 1000; // seconds to ms
+    alreadyWait += (end.tv_nsec - start.tv_nsec) / 1000000; // nanosecondes to ms
 
 	return alreadyWait;
 }
@@ -1573,7 +1580,7 @@ int main(int argc, char *argv[]) {
 
 	// Read driver data
 	readDriverData(drivers);
-	
+
 	// variable to store where we are in the championship
 	int raceNumber;
 	enum RacePhase phase;

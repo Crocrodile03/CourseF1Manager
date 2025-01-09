@@ -208,6 +208,6 @@ Liste des fonctions qui "écrivent" des données
 | void setRaceAsOver()| Met à `true` le flag raceOver | 
 | void setCarTimeAndStatusAsProcessed(int i)| Met à `true` le flag processed de la zone CarTimeAndStatus n° i | 
 | void updateCarStat(CarStat carStat, int i)| Met à jour les données CarStat de la zone n°i | 
-| int sendDataToController(int id, CarTimeAndStatus status)| Met à jour les données d'une section pour le controller.  Retourne le nombre de milliseconds "perdues" dans l'opération (c'est la somme des waits que la fonction à fait en attendant d'avoir accès en exclusive à la mémoire partagée | 
+| int sendDataToController(int id, CarTimeAndStatus status)| Met à jour les données d'une section pour le controller.  Retourne le nombre de milliseconds "perdues" dans l'opération (temps pour faire l'update de la mémoire partagée) | 
 
 

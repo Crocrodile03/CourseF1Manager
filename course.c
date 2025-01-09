@@ -1305,12 +1305,12 @@ void cleanupSharedMemory(int signum) {
 
 // send data to controller, return "lost time" for update (time waited for locking semaphore and controller)
 int sendDataToController(int id, CarTimeAndStatus status) {
-    // variables to keep track of the time "lost" for sending the data
+	// variables to keep track of the time "lost" for sending the data
 	struct timespec start, end;
-    long alreadyWait;
+	long alreadyWait = 0;
 
-    // Get start time
-    clock_gettime(CLOCK_MONOTONIC, &start);
+	// Get start time
+	clock_gettime(CLOCK_MONOTONIC, &start);
 		
 	// loop until data are copied to shared memory
 	while (1) {
@@ -1337,13 +1337,13 @@ int sendDataToController(int id, CarTimeAndStatus status) {
 		break;
 	}
 
-    // Get end time
-    clock_gettime(CLOCK_MONOTONIC, &end);
+	// Get end time
+	clock_gettime(CLOCK_MONOTONIC, &end);
 
-    // Compute diff in milliseconds
-    alreadyWait = (end.tv_sec - start.tv_sec) * 1000; // seconds to ms
-    alreadyWait += (end.tv_nsec - start.tv_nsec) / 1000000; // nanosecondes to ms
-
+	// Compute diff in milliseconds
+	alreadyWait = (end.tv_sec - start.tv_sec) * 1000; // seconds to ms
+	alreadyWait += (end.tv_nsec - start.tv_nsec) / 1000000; // nanosecondes to ms
+	
 	return alreadyWait;
 }
 

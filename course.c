@@ -1137,7 +1137,7 @@ void carSimulatorRace(int id, CarTime delay, int maxLap) {
 	
 	// determine very 1st section time
 	CarTime sectionTime;
-	sectionTime.seconds = 25 + (rand() % 10); // between 25 and 35 seconds (we will add delay)
+	sectionTime.seconds = 30 + (rand() % 4); // between 30 and 33 seconds (we will add delay)
 	sectionTime.milliseconds = rand() % 1000;
 
 	// add delay (time lost on starting grid), between 0 and 9,5 seconds
